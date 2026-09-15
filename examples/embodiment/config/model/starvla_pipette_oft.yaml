@@ -1,0 +1,33 @@
+# Model fragment only. The serial real-robot environment/runner is separate;
+# do not combine this with the LIBERO environment to command a G1.
+defaults:
+  - starvla
+  - _self_
+
+model_path: ???
+action_dim: 3
+num_action_chunks: 30
+policy_setup: pipette
+# Copy the exact top-level key from this checkpoint's dataset_statistics.json.
+unnorm_key: new_embodiment
+action_stats_source: q01q99
+use_proprio: true
+add_value_head: false
+is_lora: false
+
+starvla:
+  # Full SFT config, including state_dim and action_mode_state_map.
+  config_path: ???
+  framework_name: QwenOFT
+  enable_state_input: true
+  use_policy_norm_processor: true
+  expected_action_dim: 3
+  expected_num_action_chunks: 30
+  expected_image_size: [256, 256]
+  train_action_head_only: true
+  # Blackwell bf16: changing batch size changes Qwen numerics/log-probs.
+  # Use actor.micro_batch_size=1 and accumulate gradients across the group.
+  require_single_sample: true
+  # exp(-3.5) in normalized action units; check physical mm using q01/q99.
+  # OFT exploration uses this value, not the FAST/text temperature setting.
+  actor_logstd_init: -3.5

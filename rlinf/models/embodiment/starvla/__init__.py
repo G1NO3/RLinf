@@ -29,7 +29,7 @@ from omegaconf import DictConfig
 from rlinf.utils.logging import get_logger
 
 from .starvla_action_model import StarVLAForRLActionPrediction
-from .utils.profile import resolve_vlm_interface
+from .utils.profile import infer_policy_profile, resolve_vlm_interface
 
 
 def get_model(
@@ -81,13 +81,19 @@ def get_model(
             "ensure it is importable as the Python module 'starVLA'."
         ) from e
 
-    starvla_model = baseframework.from_pretrained(ckpt_path)
+    starvla_cfg = getattr(cfg, "starvla", None)
+    config_path = getattr(starvla_cfg, "config_path", None)
+    if config_path:
+        starvla_model = baseframework.from_pretrained(
+            ckpt_path, config_path=config_path
+        )
+    else:
+        starvla_model = baseframework.from_pretrained(ckpt_path)
 
     # Check early whether the loaded model provides a compatible interface.
     resolve_vlm_interface(starvla_model)
 
     # 'framework_name' is optional but helps infer the expected wiring for some checkpoints.
-    starvla_cfg = getattr(cfg, "starvla", None)
     framework_name = getattr(starvla_cfg, "framework_name", None)
     if framework_name is not None:
         framework_name = str(framework_name).strip()
@@ -98,9 +104,46 @@ def get_model(
     if enable_state_input is None:
         enable_state_input = getattr(cfg, "enable_state_input", True)
 
+    state_normalizer = None
+    action_denormalizer = None
+    view_preprocessor = None
+    use_checkpoint_processor = getattr(
+        starvla_cfg, "use_policy_norm_processor", enable_state_input
+    )
+    if (
+        use_checkpoint_processor
+        and infer_policy_profile(starvla_model)["action_head_type"] == "oft"
+    ):
+        from deployment.model_server.policy_norm_processor import PolicyNormProcessor
+
+        processor_args = {"unnorm_key": getattr(cfg, "unnorm_key", None)}
+        if config_path:
+            processor_args["config_path"] = config_path
+        processor = PolicyNormProcessor(ckpt_path, **processor_args)
+        if enable_state_input:
+            expected_dim = int(starvla_model.config.framework.action_model.state_dim)
+            if sum(processor.state_key_dims.values()) != expected_dim:
+                raise ValueError(
+                    "OFT state statistics do not match the checkpoint state_dim"
+                )
+            state_normalizer = processor.apply_state
+        if sum(processor.action_key_dims.values()) != cfg.action_dim:
+            raise ValueError("OFT action statistics do not match action_dim")
+        action_denormalizer = processor.unapply_actions
+        view_preprocessor = getattr(
+            processor.data_config, "serve_view_preprocess", None
+        )
+
     # Cast to requested dtype.
     if torch_dtype is not None:
         starvla_model = starvla_model.to(dtype=torch_dtype)
+
+    if getattr(starvla_cfg, "train_action_head_only", False):
+        if infer_policy_profile(starvla_model)["action_head_type"] != "oft":
+            raise ValueError("train_action_head_only is supported only for OFT")
+        starvla_model.requires_grad_(False)
+        # Keep small optimizer updates representable with a frozen bf16 backbone.
+        starvla_model.action_model.float().requires_grad_(True)
 
     return StarVLAForRLActionPrediction(
         starvla_model=starvla_model,
@@ -111,6 +154,11 @@ def get_model(
         action_stats_source=getattr(cfg, "action_stats_source", "minmax"),
         enable_state_input=enable_state_input,
         policy_setup=getattr(cfg, "policy_setup", None),
+        state_normalizer=state_normalizer,
+        action_denormalizer=action_denormalizer,
+        view_preprocessor=view_preprocessor,
+        actor_logstd_init=getattr(starvla_cfg, "actor_logstd_init", -2.5),
+        require_single_sample=getattr(starvla_cfg, "require_single_sample", False),
     )
 
 

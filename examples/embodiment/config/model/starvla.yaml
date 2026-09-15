@@ -41,7 +41,8 @@ low_cpu_mem_usage: True
 starvla:
   ckpt_path: ${..model_path}
   # Unified starVLA wrapper switch for feeding proprio/state into action heads.
-  # Applies to Adapter / PI / GR00T / Dual paths. OFT remains state-free.
+  # OFT uses checkpoint-normalized state tokens, identical to state-conditioned SFT.
+  # State-free OFT checkpoints must explicitly set this to False.
   enable_state_input: True
   # Informational fields for consistency checks in experiment configs.
   framework_name: "QwenOFT"

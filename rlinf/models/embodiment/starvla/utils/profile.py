@@ -39,6 +39,7 @@ _ACTION_HEAD_BY_TOKEN: dict[str, str] = {
 
 RL_BATCH_TENSOR_KEYS_TO_IGNORE: set[str] = {
     "action",
+    "action_for_logprob",
     "action_tokens",
     "prev_logprobs",
     "prev_values",
@@ -257,6 +258,10 @@ def resolve_action_chunk_len(
         if future is not None:
             return future + 1
 
+    if action_head_name == "oft":
+        horizon = cfg_int("action_horizon")
+        if horizon is not None:
+            return horizon
     if action_head_name in {"oft", "pi", "gr00t", "dual"}:
         past = cfg_int("past_action_window_size")
         future = cfg_int("future_action_window_size")

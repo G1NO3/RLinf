@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 from deployment.model_server.tools.image_tools import to_pil_preserve
 from starVLA.training.trainer_utils.trainer_tools import (
@@ -46,11 +47,47 @@ def _build_oft_vlm_inputs(
     """Build OFT prompt format by appending action-token placeholders."""
     batch_images = [to_pil_preserve(example["image"]) for example in examples]
     instructions = [example["lang"] for example in examples]
+    has_state = ["state" in example for example in examples]
+    if any(has_state):
+        if not all(has_state):
+            raise ValueError(
+                "OFT batch mixes state-conditioned and state-free examples"
+            )
+        encode_state = getattr(
+            starvla_model, "add_discretized_state_to_instruction", None
+        )
+        if not callable(encode_state):
+            raise ValueError("OFT checkpoint does not provide the SFT state tokenizer")
+        instructions = encode_state(
+            instructions, [example["state"] for example in examples]
+        )
 
     from ..utils.vlm_preprocess import get_train_image_size
 
+    vla_data = getattr(
+        getattr(getattr(starvla_model, "config", None), "datasets", None),
+        "vla_data",
+        None,
+    )
+    obs_image_size = getattr(vla_data, "obs_image_size", None)
     train_obs_image_size = get_train_image_size(starvla_model)
-    if train_obs_image_size:
+    if obs_image_size:
+        # Native QwenOFT defines obs_image_size as [height, width], either
+        # uniform or per view. PIL takes the opposite order.
+        sizes = list(obs_image_size)
+        for index, views in enumerate(batch_images):
+            per_view = (
+                [sizes] * len(views)
+                if len(sizes) == 2 and all(isinstance(v, (int, float)) for v in sizes)
+                else sizes
+            )
+            if len(per_view) != len(views) or any(len(s) != 2 for s in per_view):
+                raise ValueError("OFT obs_image_size must match the number of views")
+            batch_images[index] = [
+                image.resize((int(size[1]), int(size[0])))
+                for image, size in zip(views, per_view)
+            ]
+    elif train_obs_image_size:
         batch_images = starvla_resize_images(
             batch_images, target_size=train_obs_image_size
         )
@@ -94,7 +131,7 @@ def _run_oft_backbone_and_head(
     )
     model = policy.starvla_model
     last_hidden = backbone_output["last_hidden"]
-    with torch.autocast("cuda", dtype=torch.float32):
+    with torch.autocast(last_hidden.device.type, enabled=False):
         input_ids = model_inputs["input_ids"]
         action_queries = model._gather_action_token_embeddings(
             last_hidden,
@@ -103,7 +140,11 @@ def _run_oft_backbone_and_head(
         )
         mean_actions = model.action_model.predict_action(action_queries)
 
-    dist = Normal(mean_actions, torch.exp(policy.actor_logstd).view(1, 1, -1))
+    # Preserve sampled actions and likelihood arithmetic in fp32 even when
+    # the backbone/action head use bf16.
+    dist = Normal(
+        mean_actions.float(), torch.exp(policy.actor_logstd.float()).view(1, 1, -1)
+    )
     return mean_actions, last_hidden, dist
 
 
@@ -141,7 +182,7 @@ def run_default_forward_oft(
         data_pipeline_utils.fetch_action_for_logprob_for_default_forward(
             policy,
             data=data,
-            reference=mean_actions,
+            reference=dist.loc,
         )
     )
 
@@ -181,6 +222,16 @@ def run_rollout_oft(
         num_action_chunks=policy.num_action_chunks,
         examples=examples,
     )
+    # Pad BEFORE sampling, not just when serializing the rollout. Changing
+    # attention shapes only during replay changes bf16 Qwen outputs enough to
+    # corrupt the probability ratio even with unchanged weights.
+    model_inputs, policy._rollout_prompt_seq_len = (
+        data_pipeline_utils.normalize_model_inputs_for_storage(
+            model_inputs=model_inputs,
+            starvla_model=policy.starvla_model,
+            rollout_prompt_seq_len=policy._rollout_prompt_seq_len,
+        )
+    )
     mean_actions, last_hidden, dist = _run_oft_backbone_and_head(
         policy,
         model_inputs=model_inputs,
@@ -212,5 +263,12 @@ def run_rollout_oft(
         "extra_forward_inputs": {
             "action_for_logprob": executed_actions.to(dtype=torch.float32)
         },
-        "state": None,
+        # Training consumes the cached input_ids containing these state tokens.
+        # Keep normalized state as well for diagnostics; never rebuild the prompt
+        # from a later robot observation when recomputing log probabilities.
+        "state": (
+            torch.as_tensor(np.stack([e["state"] for e in examples]))
+            if policy.uses_state_input
+            else None
+        ),
     }

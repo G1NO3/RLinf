@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import warnings
 from functools import partial
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
@@ -63,6 +63,11 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         action_stats_source: str = "minmax",
         enable_state_input: bool = True,
         policy_setup: Optional[str] = None,
+        state_normalizer: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        action_denormalizer: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        view_preprocessor: Optional[Callable] = None,
+        actor_logstd_init: float = -2.5,
+        require_single_sample: bool = False,
     ):
         super().__init__()
 
@@ -93,6 +98,16 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         self.action_head_type = policy_profile["action_head_type"]
         self.state_adapter_type = policy_profile["state_adapter_type"]
         self.vlm_type = policy_profile["vlm_type"]
+        self.state_normalizer = state_normalizer
+        self.action_denormalizer = action_denormalizer
+        self.view_preprocessor = view_preprocessor
+        self.require_single_sample = bool(require_single_sample)
+        if self.action_head_type == "oft" and self.enable_state_input:
+            if state_normalizer is None:
+                raise ValueError(
+                    "State-conditioned OFT requires a checkpoint state_normalizer. "
+                    "For state-free checkpoints set enable_state_input=False."
+                )
 
         # 4) Resolve policy parameter dtype (used for added heads/params).
         policy_param_dtype = next(
@@ -106,8 +121,12 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             hidden_size = infer_hidden_size(starvla_model)
             self.value_head = nn.Linear(hidden_size, 1).to(dtype=policy_param_dtype)
 
+        if not np.isfinite(actor_logstd_init):
+            raise ValueError("actor_logstd_init must be finite")
         self.actor_logstd = nn.Parameter(
-            torch.full((self.action_dim,), -2.5, dtype=policy_param_dtype)
+            torch.full(
+                (self.action_dim,), float(actor_logstd_init), dtype=torch.float32
+            )
         )
 
         # 6) Rollout/training caches.
@@ -116,7 +135,34 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
     @property
     def uses_state_input(self) -> bool:
         """Return whether the active policy path should consume proprio/state."""
-        return self.enable_state_input and self.action_head_type != "oft"
+        return self.enable_state_input
+
+    def prepare_oft_state(self, state, **kwargs) -> torch.Tensor:
+        """Normalize one measured state using the SFT checkpoint's transforms.
+
+        OFT embeds a single state in its prompt. Missing dimensions, extra
+        history, and non-finite inputs are errors; no trimming or padding is
+        permitted for this path.
+        """
+        del kwargs
+        raw = (
+            data_pipeline_utils.tensor_to_numpy_compatible(state)
+            if torch.is_tensor(state)
+            else np.asarray(state)
+        )
+        expected = int(self.starvla_model.config.framework.action_model.state_dim)
+        if raw.shape == (expected,):
+            raw = raw[None, :]
+        if raw.shape != (1, expected) or not np.isfinite(raw).all():
+            raise ValueError(
+                f"OFT requires one finite state of shape (1, {expected}); got {raw.shape}"
+            )
+        normalized = np.asarray(self.state_normalizer(raw), dtype=np.float32)
+        if normalized.shape != raw.shape or not np.isfinite(normalized).all():
+            raise ValueError(
+                "Checkpoint state normalization returned invalid OFT state"
+            )
+        return torch.from_numpy(normalized.copy()).unsqueeze(0)
 
     def forward(
         self,
@@ -176,6 +222,13 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             raise ValueError(
                 "starVLA.default_forward requires tensor values inside 'forward_inputs'."
             )
+        if self.require_single_sample and (
+            "input_ids" not in data or data["input_ids"].shape[0] != 1
+        ):
+            raise ValueError(
+                "This checkpoint requires micro-batch=1 for rollout/replay parity; "
+                "accumulate gradients across samples instead of batching them."
+            )
         # Automatically dispatch to the correct default forward handler based on action head type.
         handler = get_default_forward_handler(self.action_head_type)
         if handler is None:
@@ -221,17 +274,29 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         """
         del return_obs
 
+        if self.require_single_sample and len(env_obs["main_images"]) != 1:
+            raise ValueError("This checkpoint requires rollout micro-batch=1")
+
         # Build examples based on env_obs and state adapter.
-        examples = data_pipeline_utils.build_examples_from_env_obs(
-            env_obs=env_obs,
-            state_adapter_name=self.state_adapter_type,
-            prepare_state_tensor=partial(
+        if self.action_head_type == "oft" and self.uses_state_input:
+            if env_obs.get("states") is None:
+                raise ValueError("State-conditioned OFT requires env_obs['states']")
+            prepare_state = self.prepare_oft_state
+        else:
+            prepare_state = partial(
                 state_utils.prepare_state_tensor,
                 starvla_model=self.starvla_model,
                 default_state_adapter_name=self.state_adapter_type,
-            ),
+            )
+        examples = data_pipeline_utils.build_examples_from_env_obs(
+            env_obs=env_obs,
+            state_adapter_name=self.state_adapter_type,
+            prepare_state_tensor=prepare_state,
             include_state=self.uses_state_input,
         )
+        if self.view_preprocessor is not None:
+            for example in examples:
+                example["image"] = self.view_preprocessor(example["image"])
         # Build sampling kwargs and initialize forward_inputs with batch-aligned sampling tensors.
         sampling_kwargs = {
             "do_sample": kwargs.pop("do_sample", False),
@@ -337,11 +402,24 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
             raise ValueError(
                 f"num_action_chunks mismatch: model returns {n_chunks}, expected {self.num_action_chunks}"
             )
-        env_chunk_actions = action_space_utils.unnormalize_actions_for_env(
-            normalized_actions=normalized_actions.astype(np.float32),
-            action_norm_stats=self._action_norm_stats,
-            policy_setup=self.policy_setup,
-        )
+        if self.action_denormalizer is not None:
+            env_chunk_actions = np.stack(
+                [
+                    self.action_denormalizer(chunk.astype(np.float32))
+                    for chunk in normalized_actions
+                ]
+            ).astype(np.float32)
+            if (
+                env_chunk_actions.shape != normalized_actions.shape
+                or not np.isfinite(env_chunk_actions).all()
+            ):
+                raise ValueError("Checkpoint action transform returned invalid actions")
+        else:
+            env_chunk_actions = action_space_utils.unnormalize_actions_for_env(
+                normalized_actions=normalized_actions.astype(np.float32),
+                action_norm_stats=self._action_norm_stats,
+                policy_setup=self.policy_setup,
+            )
 
         forward_inputs["action"] = torch.from_numpy(env_chunk_actions.reshape(bsz, -1))
 
